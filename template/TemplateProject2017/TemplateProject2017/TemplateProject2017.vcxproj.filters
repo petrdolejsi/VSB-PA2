@@ -3,8 +3,29 @@
   <ItemGroup>
     <CudaCompile Include="Runner.cu" />
     <CudaCompile Include="exercise1.cu" />
+    <CudaCompile Include="exercise2.cu" />
+    <CudaCompile Include="exercise2.cuh" />
+    <CudaCompile Include="exercise3.cu" />
+    <CudaCompile Include="exercise4.cu" />
+    <CudaCompile Include="exercise5.cu" />
+    <CudaCompile Include="exercise6.cu" />
+    <CudaCompile Include="exercise7.cu" />
+    <CudaCompile Include="exercise8.cu" />
+    <CudaCompile Include="exercise10.cu" />
+    <CudaCompile Include="project-gray.cu" />
+    <CudaCompile Include="exercise11.cu" />
+    <CudaCompile Include="project-color.cu" />
+    <CudaCompile Include="project.cu" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="exercise1.h" />
+    <ClInclude Include="exercise1.cuh" />
+    <ClInclude Include="exercise3.cuh" />
+    <ClInclude Include="imageKernels.cuh" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="cpp.hint" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="terrain10x10.tif" />
   </ItemGroup>
 </Project>
