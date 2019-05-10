@@ -42,9 +42,10 @@ cudaChannelFormatDesc cuda_tex_channel_desc;
 KernelSetting ks;
 unsigned char value = 0;
 
+//backup
 
-// backup
-
+uchar4 *d_backup;
+size_t backup_pitch;
 
 //OpenGL
 unsigned int pbo_id;
@@ -85,8 +86,8 @@ bool h_is_selected = false;
 __global__ void apply_filter(int value, int *d_image_size, float *d_red, float *d_green, float *d_blue, int *d_mouse_click, float *d_searching, unsigned char *pbo)
 {
 
-	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
-	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+	const auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	const auto row = (threadIdx.y + blockIdx.y * blockDim.y);
 
 	const auto offset = col + row * d_image_size[0];
 	uchar4 texel = tex2D(cuda_tex_ref, col, row);
@@ -104,11 +105,11 @@ __global__ void apply_filter(int value, int *d_image_size, float *d_red, float *
 	uchar4_pbo[offset] = texel;
 }
 
-__global__ void apply_filter_first_run(int *d_image_size, float *d_red, float *d_green, float *d_blue, unsigned char *pbo)
+__global__ void apply_filter_first_run(int *d_image_size, float *d_red, float *d_green, float *d_blue, uchar4* backup, unsigned int pitch, unsigned char *pbo)
 {
 
-	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
-	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+	const auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	const auto row = (threadIdx.y + blockIdx.y * blockDim.y);
 
 	const auto offset = col + row * d_image_size[0];
 	const uchar4 texel = tex2D(cuda_tex_ref, col, row);
@@ -117,8 +118,23 @@ __global__ void apply_filter_first_run(int *d_image_size, float *d_red, float *d
 	d_green[texel.y]++;
 	d_blue[texel.z]++;
 
+	const auto offset_backup = col + row * (pitch / 4);
+	backup[offset_backup] = texel;
+
 	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
 	uchar4_pbo[offset] = texel;
+}
+
+__global__ void apply_filter_restore(int *d_image_size, uchar4* backup, const unsigned int pitch, unsigned char *pbo)
+{
+	const auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	const auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+
+	const auto offset = col + row * d_image_size[0];
+	const auto offset_backup = col + row * (pitch / 4);
+
+	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
+	uchar4_pbo[offset] = backup[offset_backup];
 }
 
 __global__ void apply_filter_click(int *d_image_size, float *d_searching, unsigned char *pbo)
@@ -150,7 +166,7 @@ __global__ void apply_filter_click(int *d_image_size, float *d_searching, unsign
 
 __device__ bool check_searched(int value, uchar4 &to_test, uchar4 &result)
 {
-	if (to_test.y == 255 && to_test.z == 255)
+	if (to_test.y == 255)
 	{
 		result.x = value;
 		result.y = 255;
@@ -389,7 +405,7 @@ void save_histogram(const char *filename)
 	printf("Saved histogram as %s\n", filename);
 }
 
-void make_founded_bigger()
+void make_founds_bigger()
 {
 	if (!h_is_selected)
 	{
@@ -421,7 +437,35 @@ void make_founded_bigger()
 
 void restore_image()
 {
-	//printf("Restored image\n");
+	cudaArray* array;
+
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
+	checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
+	checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
+
+	unsigned char *pbo_data;
+	size_t pbo_size;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
+
+	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
+
+	apply_filter_restore<< <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_backup, backup_pitch, pbo_data);
+
+	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
+
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
+	glBindTexture(GL_TEXTURE_2D, texture_id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);   //Source parameter is NULL, Data is coming from a PBO, not host memory
+
+	h_mouse_click[0] = h_mouse_click[1] = -1;
+	checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
+
+	h_is_selected = false;
+
+	printf("Restored image\n\n");
 }
 
 void keyboard(const unsigned char key, int x, int y)
@@ -438,12 +482,12 @@ void keyboard(const unsigned char key, int x, int y)
 	
 	if (key == 'm')
 	{
-		make_founded_bigger();
+		make_founds_bigger();
 	}
 	
 	if (key == 'r')
 	{
-		//restore_image();
+		restore_image();
 	}
 }
 
@@ -462,11 +506,13 @@ void cuda_worker_first_run()
 
 	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
 
+	checkCudaErrors(cudaMallocPitch(&d_backup, &backup_pitch, image_width * 4, image_height));
+
 	ks.blockSize = BLOCK_DIM * BLOCK_DIM;
 	ks.dimBlock = dim3(BLOCK_DIM, BLOCK_DIM, 1);
 	ks.dimGrid = dim3((image_width + BLOCK_DIM - 1) / BLOCK_DIM, (image_height + BLOCK_DIM - 1) / BLOCK_DIM, 1);
 
-	apply_filter_first_run << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_red, d_green, d_blue, pbo_data);
+	apply_filter_first_run << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_red, d_green, d_blue, d_backup, backup_pitch, pbo_data);
 
 	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
 	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
@@ -548,6 +594,8 @@ void init_cuda_tex()
 
 void release_cuda()
 {
+	checkCudaErrors(cudaFree(d_backup));
+	
 	checkCudaErrors(cudaFree(d_red));
 	checkCudaErrors(cudaFree(d_green));
 	checkCudaErrors(cudaFree(d_blue));
