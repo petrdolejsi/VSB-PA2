@@ -558,8 +558,8 @@ void cuda_worker()
 	//done in cuda_worker_first_run
 
 	//Calling applyFilter kernel
-	value+=2;
-	if (value > 200) value = 30;
+	value-=2;
+	if (value < 10) value = 255;
 
 	apply_filter << <ks.dimGrid, ks.dimBlock >> > (value, d_image_size, d_red, d_green, d_blue, d_mouse_click, d_searching, pbo_data);
 
@@ -786,6 +786,11 @@ void project(const int argc, char *argv[])
 	init_cuda_tex();
 
 	cuda_worker_first_run();
+
+	printf("------------------------------------------------------------------------\n\n");
+	printf("To select color, use the cursor and click somewhere on the image\n");
+	printf("Keyboard shortcuts: \n\t s - create and Save histogram (histogram.png) \n\t m - Make founds (if exist) bigger \n\t r - Restore image (hide founds and make image brighter) \n\t ESC - close image and terminate program\n\n");
+	printf("------------------------------------------------------------------------\n");
 
 	//start rendering main loop
 	glutMainLoop();
