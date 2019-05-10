@@ -40,7 +40,11 @@ cudaGraphicsResource_t cuda_tex_resource;
 texture<uchar4, 2, cudaReadModeElementType> cuda_tex_ref;
 cudaChannelFormatDesc cuda_tex_channel_desc;
 KernelSetting ks;
-unsigned char some_value = 0;
+unsigned char value = 0;
+
+
+// backup
+
 
 //OpenGL
 unsigned int pbo_id;
@@ -74,12 +78,11 @@ int *d_viewport_size;
 int h_image_size[2];
 int *d_image_size;
 
-bool h_to_check[4];
-bool *d_to_check;
+bool h_is_selected = false;
 
 #pragma region CUDA Routines
 
-__global__ void apply_filter(int *d_image_size, float *d_red, float *d_green, float *d_blue, int *d_mouse_click, float *d_searching, bool *d_to_check, unsigned char *pbo)
+__global__ void apply_filter(int value, int *d_image_size, float *d_red, float *d_green, float *d_blue, int *d_mouse_click, float *d_searching, unsigned char *pbo)
 {
 
 	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
@@ -88,31 +91,12 @@ __global__ void apply_filter(int *d_image_size, float *d_red, float *d_green, fl
 	const auto offset = col + row * d_image_size[0];
 	uchar4 texel = tex2D(cuda_tex_ref, col, row);
 
-	if (d_to_check[2])
+	if (d_mouse_click[0] != -1)
 	{
-		d_red[texel.x]++;
-		d_green[texel.y]++;
-		d_blue[texel.z]++;
-
-		d_to_check[3] = true;
-	}
-
-	if (d_mouse_click[0] != -1 && d_to_check[0])
-	{
-		if (texel.x == d_searching[0] && texel.y == d_searching[1] && texel.z == d_searching[2])
+		if (texel.y == 255 && texel.z == 255)
 		{
-			texel.x = 255;
-			texel.y = 255;
-			texel.z = 255;
+			texel.x = value;
 		}
-		else
-		{
-			texel.x = texel.x >> 3;
-			texel.y = texel.y >> 3;
-			texel.z = texel.z >> 3;
-		}
-
-		d_to_check[1] = true;
 	}
 
 	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
@@ -120,26 +104,125 @@ __global__ void apply_filter(int *d_image_size, float *d_red, float *d_green, fl
 	uchar4_pbo[offset] = texel;
 }
 
-__global__ void search_color(float *d_searching, int *d_mouse_click, bool *d_to_check, int *d_viewport_size, int *d_image_size)
+__global__ void apply_filter_first_run(int *d_image_size, float *d_red, float *d_green, float *d_blue, unsigned char *pbo)
 {
-	if (d_to_check[0])
+
+	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+
+	const auto offset = col + row * d_image_size[0];
+	const uchar4 texel = tex2D(cuda_tex_ref, col, row);
+
+	d_red[texel.x]++;
+	d_green[texel.y]++;
+	d_blue[texel.z]++;
+
+	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
+	uchar4_pbo[offset] = texel;
+}
+
+__global__ void apply_filter_click(int *d_image_size, float *d_searching, unsigned char *pbo)
+{
+
+	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+
+	const auto offset = col + row * d_image_size[0];
+	uchar4 texel = tex2D(cuda_tex_ref, col, row);
+
+	if (texel.x == d_searching[0] && texel.y == d_searching[1] && texel.z == d_searching[2])
 	{
-		printf("Clicked (viewport): %d %d\n", d_mouse_click[0], d_mouse_click[1]);
-		
-		auto mouse_x = (d_mouse_click[0] * d_image_size[0]) / d_viewport_size[0];
-		auto mouse_y = d_image_size[1] - (d_mouse_click[1] * d_image_size[1]) / d_viewport_size[1];
-
-		printf("Clicked (image): %d %d\n", mouse_x, d_image_size[1] - mouse_y);
-
-		// ReSharper disable once CppLocalVariableMayBeConst
-		uchar4 texel = tex2D(cuda_tex_ref, mouse_x, mouse_y);
-
-		d_searching[0] = texel.x;
-		d_searching[1] = texel.y;
-		d_searching[2] = texel.z;
-
-		printf("Selected color: %d %d %d\n", texel.x, texel.y, texel.z);
+		texel.x = 255;
+		texel.y = 255;
+		texel.z = 255;
 	}
+	else
+	{
+		texel.x = texel.x >> 3;
+		texel.y = texel.y >> 3;
+		texel.z = texel.z >> 3;
+	}
+
+	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
+
+	uchar4_pbo[offset] = texel;
+}
+
+__device__ bool check_searched(int value, uchar4 &to_test, uchar4 &result)
+{
+	if (to_test.y == 255 && to_test.z == 255)
+	{
+		result.x = value;
+		result.y = 255;
+		result.z = 255;
+
+		return false;
+	}
+	return true;
+}
+
+__global__ void search_neighbourhood (int value, int *d_image_size, unsigned char *pbo)
+{
+
+	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+
+	const auto offset = col + row * d_image_size[0];
+	uchar4 texel = tex2D(cuda_tex_ref, col, row);
+	uchar4 s = tex2D(cuda_tex_ref, col, row + 1);
+	uchar4 es = tex2D(cuda_tex_ref, col + 1, row + 1);
+	uchar4 e = tex2D(cuda_tex_ref, col + 1, row);
+	uchar4 en = tex2D(cuda_tex_ref, col + 1, row - 1);
+	uchar4 n = tex2D(cuda_tex_ref, col, row - 1);
+	uchar4 nw = tex2D(cuda_tex_ref, col - 1, row + 1);
+	uchar4 w = tex2D(cuda_tex_ref, col - 1, row);
+	uchar4 sw = tex2D(cuda_tex_ref, col - 1, row - 1);
+
+	if (check_searched(value, s, texel))
+	{
+		if (check_searched(value, es, texel))
+		{
+			if (check_searched(value, e, texel))
+			{
+				if (check_searched(value, en, texel))
+				{
+					if (check_searched(value, n, texel))
+					{
+						if (check_searched(value, nw, texel))
+						{
+							if (check_searched(value, w, texel))
+							{
+								check_searched(value, sw, texel);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	const auto uchar4_pbo = reinterpret_cast<uchar4*>(pbo);
+
+	uchar4_pbo[offset] = texel;
+}
+
+__global__ void search_color(float *d_searching, int *d_mouse_click, int *d_viewport_size, int *d_image_size)
+{
+	printf("Clicked (viewport): %d %d\n", d_mouse_click[0], d_mouse_click[1]);
+
+	auto mouse_x = (d_mouse_click[0] * d_image_size[0]) / d_viewport_size[0];
+	auto mouse_y = d_image_size[1] - (d_mouse_click[1] * d_image_size[1]) / d_viewport_size[1];
+
+	printf("Clicked (image): %d %d\n", mouse_x, d_image_size[1] - mouse_y);
+
+	// ReSharper disable once CppLocalVariableMayBeConst
+	uchar4 texel = tex2D(cuda_tex_ref, mouse_x, mouse_y);
+
+	d_searching[0] = texel.x;
+	d_searching[1] = texel.y;
+	d_searching[2] = texel.z;
+
+	printf("Selected color: %d %d %d\n", texel.x, texel.y, texel.z);
 }
 
 __global__ void draw_histogram(const unsigned int histogram_height, const unsigned int dst_pitch, float *d_red, float *d_green, float *d_blue, float *d_max, uchar4* dst)
@@ -207,39 +290,38 @@ __global__ void draw_histogram(const unsigned int histogram_height, const unsign
 void mouse_click(const int button, const int state, const int x, const int y)
 {
 
-	if (button == GLUT_LEFT_BUTTON)
+	if (!h_is_selected && button == GLUT_LEFT_BUTTON && state == GLUT_DOWN)
 	{
-		if (state == GLUT_DOWN)
-		{
-			h_mouse_click[0] = x;
-			h_mouse_click[1] = y;
+		h_mouse_click[0] = x;
+		h_mouse_click[1] = y;
 
-			cudaArray* array;
-			cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr);
-			cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0);
-			cudaGetChannelDesc(&cuda_tex_channel_desc, array);
-			cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc);
-			checkError();
+		cudaArray* array;
+		checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
+		checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
+		checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
+		checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
 
-			unsigned char *pbo_data;
-			size_t pbo_size;
-			cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr);
+		unsigned char *pbo_data;
+		size_t pbo_size;
+		checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
 
-			cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource);
-			checkError();
+		checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
 
-			checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
 
-			search_color <<< 1, 1 >>> (d_searching, d_mouse_click, d_to_check, d_viewport_size, d_image_size);
+		search_color << < 1, 1 >> > (d_searching, d_mouse_click, d_viewport_size, d_image_size);
 
-			cudaUnbindTexture(&cuda_tex_ref);
-			cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr);
-			cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr);
+		apply_filter_click << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_searching, pbo_data);
 
-			glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
-			glBindTexture(GL_TEXTURE_2D, texture_id);
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-		}
+		checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+		checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+		checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
+
+		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
+		glBindTexture(GL_TEXTURE_2D, texture_id);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+		h_is_selected = true;
 	}
 }
 
@@ -307,6 +389,36 @@ void save_histogram(const char *filename)
 	printf("Saved histogram as %s\n", filename);
 }
 
+void make_founded_bigger()
+{
+	if (!h_is_selected)
+	{
+		return;
+	}
+	
+	cudaArray* array;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
+	checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
+	checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
+
+	unsigned char *pbo_data;
+	size_t pbo_size;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
+
+	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
+
+	search_neighbourhood << <ks.dimGrid, ks.dimBlock >> > (value, d_image_size, pbo_data);
+
+	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
+
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
+	glBindTexture(GL_TEXTURE_2D, texture_id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+}
+
 void restore_image()
 {
 	//printf("Restored image\n");
@@ -323,11 +435,53 @@ void keyboard(const unsigned char key, int x, int y)
 	{
 		save_histogram("histogram.png");
 	}
-
+	
+	if (key == 'm')
+	{
+		make_founded_bigger();
+	}
+	
 	if (key == 'r')
 	{
 		//restore_image();
 	}
+}
+
+void cuda_worker_first_run()
+{
+	cudaArray* array;
+
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
+	checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
+	checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
+
+	unsigned char *pbo_data;
+	size_t pbo_size;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
+
+	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
+
+	ks.blockSize = BLOCK_DIM * BLOCK_DIM;
+	ks.dimBlock = dim3(BLOCK_DIM, BLOCK_DIM, 1);
+	ks.dimGrid = dim3((image_width + BLOCK_DIM - 1) / BLOCK_DIM, (image_height + BLOCK_DIM - 1) / BLOCK_DIM, 1);
+
+	apply_filter_first_run << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_red, d_green, d_blue, pbo_data);
+
+	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
+
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
+	glBindTexture(GL_TEXTURE_2D, texture_id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);   //Source parameter is NULL, Data is coming from a PBO, not host memory
+
+	checkCudaErrors(cudaMemcpy(h_red, d_red, size, cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(h_green, d_green, size, cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(h_blue, d_blue, size, cudaMemcpyDeviceToHost));
+
+	h_mouse_click[0] = -1;
+	checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
 }
 
 void cuda_worker()
@@ -335,68 +489,42 @@ void cuda_worker()
 	cudaArray* array;
 
 	//T ODO 3: Map cudaTexResource
-	cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr);
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
 
 	//T ODO 4: Get Mapped Array of cudaTexResource
-	cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0);
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
 
 	//T ODO 5: Get cudaTexChannelDesc from previously obtained array
-	cudaGetChannelDesc(&cuda_tex_channel_desc, array);
+	checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
 
 	//T ODO 6: Bind cudaTexRef to array
-	cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc);
-	checkError();
+	checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
 
 	unsigned char *pbo_data;
 	size_t pbo_size;
 	//T ODO 7: Map cudaPBOResource
-	cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr);
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
 
 	//T ODO 7: Map Mapped pointer to cudaPBOResource data
-	cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource);
-	checkError();
+	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
 
 	//T ODO 8: Set KernelSetting variable ks (dimBlock, dimGrid, etc.) such that block will have BLOCK_DIM x BLOCK_DIM threads
-	//...
-	ks.blockSize = BLOCK_DIM * BLOCK_DIM;
-	ks.dimBlock = dim3(BLOCK_DIM, BLOCK_DIM, 1);
-	ks.dimGrid = dim3((image_width + BLOCK_DIM - 1) / BLOCK_DIM, (image_height + BLOCK_DIM - 1) / BLOCK_DIM, 1);
-
+	//done in cuda_worker_first_run
 
 	//Calling applyFilter kernel
-	some_value+=2;
-	if (some_value > 200) some_value = 30;
+	value+=2;
+	if (value > 200) value = 30;
 
-	apply_filter << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_red, d_green, d_blue, d_mouse_click, d_searching, d_to_check, pbo_data);
+	apply_filter << <ks.dimGrid, ks.dimBlock >> > (value, d_image_size, d_red, d_green, d_blue, d_mouse_click, d_searching, pbo_data);
 
 	//Following code release mapped resources, unbinds texture and ensures that PBO data will be copied into OpenGL texture. Do not modify following code!
-	cudaUnbindTexture(&cuda_tex_ref);
-	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr);
-	cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr);
+	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
 
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
 	glBindTexture(GL_TEXTURE_2D, texture_id);
 	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);   //Source parameter is NULL, Data is coming from a PBO, not host memory
-
-	checkCudaErrors(cudaMemcpy(&h_to_check, d_to_check, 4 * sizeof(bool), cudaMemcpyDeviceToHost));
-	if (h_to_check[3])
-	{
-		checkCudaErrors(cudaMemcpy(h_red, d_red, size, cudaMemcpyDeviceToHost));
-		checkCudaErrors(cudaMemcpy(h_green, d_green, size, cudaMemcpyDeviceToHost));
-		checkCudaErrors(cudaMemcpy(h_blue, d_blue, size, cudaMemcpyDeviceToHost));
-
-		h_to_check[2] = false;
-	}
-
-	if (h_to_check[1])
-	{
-		h_to_check[0] = false;
-	}
-
-	checkCudaErrors(cudaMemcpy(d_to_check, &h_to_check, 4 * sizeof(bool), cudaMemcpyHostToDevice));
-
-	h_mouse_click[0] = -1;
-	checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
 }
 
 void init_cuda_tex()
@@ -406,20 +534,16 @@ void init_cuda_tex()
 	checkError();
 
 	//T ODO 1: Register OpenGL texture to CUDA resource
-	cudaGraphicsGLRegisterImage(&cuda_tex_resource, texture_id, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsReadOnly);
+	checkCudaErrors(cudaGraphicsGLRegisterImage(&cuda_tex_resource, texture_id, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsReadOnly));
 
 	//CUDA Texture settings
 	cuda_tex_ref.normalized = false;						//Otherwise TRUE to access with normalized texture coordinates
-	cuda_tex_ref.filterMode = cudaFilterModePoint;		//Otherwise texRef.filterMode = cudaFilterModeLinear; for Linear interpolation of texels
-	cuda_tex_ref.addressMode[0] = cudaAddressModeClamp;	//No repeat texture pattern
-	cuda_tex_ref.addressMode[1] = cudaAddressModeClamp;	//No repeat texture pattern
-
-	checkError();
+	cuda_tex_ref.filterMode = cudaFilterModePoint;			//Otherwise texRef.filterMode = cudaFilterModeLinear; for Linear interpolation of texels
+	cuda_tex_ref.addressMode[0] = cudaAddressModeClamp;		//No repeat texture pattern
+	cuda_tex_ref.addressMode[1] = cudaAddressModeClamp;		//No repeat texture pattern
 
 	//T ODO 2: Register PBO to CUDA resource
-	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo_id, cudaGraphicsRegisterFlagsWriteDiscard);
-
-	checkError();
+	checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo_id, cudaGraphicsRegisterFlagsWriteDiscard));
 }
 
 void release_cuda()
@@ -430,12 +554,11 @@ void release_cuda()
 	checkCudaErrors(cudaFree(d_max));
 	checkCudaErrors(cudaFree(d_searching));
 	checkCudaErrors(cudaFree(d_mouse_click));
-	checkCudaErrors(cudaFree(d_to_check));
 	checkCudaErrors(cudaFree(d_viewport_size));
 	checkCudaErrors(cudaFree(d_image_size));
 	
-	cudaGraphicsUnregisterResource(cuda_pbo_resource);
-	cudaGraphicsUnregisterResource(cuda_tex_resource);
+	checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
+	checkCudaErrors(cudaGraphicsUnregisterResource(cuda_tex_resource));
 }
 #pragma endregion
 
@@ -489,11 +612,6 @@ void load_texture(const char* image_file_name)
 	h_mouse_click[0] = h_mouse_click[1] = -1;
 	checkCudaErrors(cudaMemcpy(d_mouse_click, h_mouse_click, sizeof(int) * 2, cudaMemcpyHostToDevice));
 
-	checkCudaErrors(cudaMalloc(&d_to_check, 4 * sizeof(bool)));
-	h_to_check[0] = h_to_check[2] = true;
-	h_to_check[1] = h_to_check[3] = false;
-	checkCudaErrors(cudaMemcpy(d_to_check, &h_to_check, 4 * sizeof(bool), cudaMemcpyHostToDevice));
-
 	checkCudaErrors(cudaMalloc(&d_viewport_size, sizeof(int) * 2));
 	h_viewport_size[0] = viewport_width;
 	h_viewport_size[1] = viewport_height;
@@ -536,7 +654,7 @@ void my_display()
 	glutSwapBuffers();
 }
 
-void my_resize(GLsizei w, GLsizei h)
+void my_resize(const GLsizei w, const GLsizei h)
 {
 	viewport_width = w;
 	viewport_height = h;
@@ -618,6 +736,8 @@ void project(const int argc, char *argv[])
 	prepare_pbo();
 
 	init_cuda_tex();
+
+	cuda_worker_first_run();
 
 	//start rendering main loop
 	glutMainLoop();
