@@ -68,7 +68,7 @@ float *h_green;
 float *h_blue;
 
 float h_max[4];
-float h_searching[3];
+float h_searching[6];
 
 int h_mouse_click[2];
 int *d_mouse_click;
@@ -137,16 +137,16 @@ __global__ void apply_filter_restore(int *d_image_size, uchar4* backup, const un
 	uchar4_pbo[offset] = backup[offset_backup];
 }
 
-__global__ void apply_filter_click(int *d_image_size, float *d_searching, unsigned char *pbo)
+__global__ void apply_filter_click(int *d_image_size, float *d_searching, uchar4* backup, const unsigned int pitch, unsigned char *pbo)
 {
-
-	auto col = (threadIdx.x + blockIdx.x * blockDim.x);
-	auto row = (threadIdx.y + blockIdx.y * blockDim.y);
+	const auto col = (threadIdx.x + blockIdx.x * blockDim.x);
+	const auto row = (threadIdx.y + blockIdx.y * blockDim.y);
 
 	const auto offset = col + row * d_image_size[0];
-	uchar4 texel = tex2D(cuda_tex_ref, col, row);
+	const auto offset_backup = col + row * (pitch / 4);
+	auto texel = backup[offset_backup];
 
-	if (texel.x == d_searching[0] && texel.y == d_searching[1] && texel.z == d_searching[2])
+	if (texel.x >= d_searching[0] && texel.y >= d_searching[1] && texel.z >= d_searching[2] && texel.x <= d_searching[3] && texel.y <= d_searching[4] && texel.z <= d_searching[5])
 	{
 		texel.x = 255;
 		texel.y = 255;
@@ -238,6 +238,10 @@ __global__ void search_color(float *d_searching, int *d_mouse_click, int *d_view
 	d_searching[1] = texel.y;
 	d_searching[2] = texel.z;
 
+	d_searching[3] = texel.x;
+	d_searching[4] = texel.y;
+	d_searching[5] = texel.z;
+
 	printf("Selected color: %d %d %d\n", texel.x, texel.y, texel.z);
 }
 
@@ -327,7 +331,7 @@ void mouse_click(const int button, const int state, const int x, const int y)
 
 		search_color << < 1, 1 >> > (d_searching, d_mouse_click, d_viewport_size, d_image_size);
 
-		apply_filter_click << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_searching, pbo_data);
+		apply_filter_click << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_searching, d_backup, backup_pitch, pbo_data);
 
 		checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
 		checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
@@ -468,6 +472,67 @@ void restore_image()
 	printf("Restored image\n\n");
 }
 
+void change_searching_range()
+{
+	if (!h_is_selected)
+	{
+		return;
+	}
+	
+	checkCudaErrors(cudaMemcpy(h_searching, d_searching, 6 * sizeof(float), cudaMemcpyDeviceToHost));
+	if (h_searching[0] >= 1)
+	{
+		h_searching[0]--;
+	}
+	if (h_searching[1] >= 1)
+	{
+		h_searching[1]--;
+	}
+	if (h_searching[2] >= 1)
+	{
+		h_searching[2]--;
+	}
+
+	if (h_searching[3] <= 254)
+	{
+		h_searching[3]++;
+	}
+	if (h_searching[4] <= 254)
+	{
+		h_searching[4]++;
+	}
+	if (h_searching[5] <= 254)
+	{
+		h_searching[5]++;
+	}
+	checkCudaErrors(cudaMemcpy(d_searching, h_searching, 6 * sizeof(float), cudaMemcpyHostToDevice));
+
+	cudaArray* array;
+
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, nullptr));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&array, cuda_tex_resource, 0, 0));
+	checkCudaErrors(cudaGetChannelDesc(&cuda_tex_channel_desc, array));
+	checkCudaErrors(cudaBindTextureToArray(&cuda_tex_ref, array, &cuda_tex_channel_desc));
+
+	unsigned char *pbo_data;
+	size_t pbo_size;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, nullptr));
+
+	checkCudaErrors(cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&pbo_data), &pbo_size, cuda_pbo_resource));
+
+	apply_filter_click << <ks.dimGrid, ks.dimBlock >> > (d_image_size, d_searching, d_backup, backup_pitch, pbo_data);
+
+	checkCudaErrors(cudaUnbindTexture(&cuda_tex_ref));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_pbo_resource, nullptr));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, nullptr));
+
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_id);
+	glBindTexture(GL_TEXTURE_2D, texture_id);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image_width, image_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);   //Source parameter is NULL, Data is coming from a PBO, not host memory
+
+	printf("Changed range of searched color\n");
+}
+
 void keyboard(const unsigned char key, int x, int y)
 {
 	if (key == 27)
@@ -488,6 +553,11 @@ void keyboard(const unsigned char key, int x, int y)
 	if (key == 'r')
 	{
 		restore_image();
+	}
+
+	if (key == 'c')
+	{
+		change_searching_range();
 	}
 }
 
@@ -648,12 +718,12 @@ void load_texture(const char* image_file_name)
 	checkCudaErrors(cudaMalloc(&d_red, size));
 	checkCudaErrors(cudaMalloc(&d_green, size));
 	checkCudaErrors(cudaMalloc(&d_blue, size));
-	checkCudaErrors(cudaMalloc(&d_searching, 3 * sizeof(float)));
+	checkCudaErrors(cudaMalloc(&d_searching, 6 * sizeof(float)));
 
 	checkCudaErrors(cudaMemcpy(d_red, h_red, size, cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_green, h_green, size, cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_blue, h_blue, size, cudaMemcpyHostToDevice));
-	checkCudaErrors(cudaMemcpy(d_searching, h_searching, 3 * sizeof(float), cudaMemcpyHostToDevice));
+	checkCudaErrors(cudaMemcpy(d_searching, h_searching, 6 * sizeof(float), cudaMemcpyHostToDevice));
 
 	checkCudaErrors(cudaMalloc(&d_mouse_click, sizeof(int) * 2));
 
@@ -789,7 +859,7 @@ void project(const int argc, char *argv[])
 
 	printf("------------------------------------------------------------------------\n\n");
 	printf("To select color, use the cursor and click somewhere on the image\n");
-	printf("Keyboard shortcuts: \n\t s - create and Save histogram (histogram.png) \n\t m - Make founds (if exist) bigger \n\t r - Restore image (hide founds and make image brighter) \n\t ESC - close image and terminate program\n\n");
+	printf("Keyboard shortcuts: \n\t s - create and Save histogram (histogram.png) \n\t m - Make founds (if exist) bigger \n\t r - Restore image (hide founds and make image brighter) \n\t c - Change range of searched color by +-1 \n\t ESC - close image and terminate program\n\n");
 	printf("------------------------------------------------------------------------\n");
 
 	//start rendering main loop
